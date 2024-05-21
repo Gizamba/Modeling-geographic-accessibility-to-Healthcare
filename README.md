@@ -1,5 +1,5 @@
 # Modeling-geographic-accessibility-to-Healthcare
-Shows workflow and results for a pilot analysis aimed at assessing the physical accessibility to public healthcare facilities in Uganda
+Shows workflow and results for a pilot analysis to assess the physical accessibility to public healthcare facilities in Uganda. Different datasets were utilized as described in the Final Project Report. Software used for this analysis included R - for data preparation, AccessMod5 - for modeling accessibility, and ArcGIS Pro - for data visualization
 ## Final Project Report
 This describes the methodology, datasets, data sources, and accessibility map outputs/ results of the analysis
 ## Data_preps_R_code
