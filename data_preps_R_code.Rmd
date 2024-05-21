@@ -1,0 +1,479 @@
+---
+title: "ACCESSIBILITY ANALYSIS: Data preps"
+author: "JMG"
+date: "2024-03-18"
+output: html_document
+---
+
+# DATA PREPARATION
+
+This involves, importing, re-projection and clipping of datasets: Admin boundaries, road network, barriers [lakes and rivers], land cover, DEM, population density and healthcare facilities
+
+## libraries
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(sf)
+library(osmextract)
+library(tmap)
+library(rgdal)
+library(dplyr)
+library(terra)
+library(doParallel)
+library(foreach)
+library(snow)
+library(raster)
+
+```
+
+# Uganda boundary
+
+Used for clipping land cover raster
+
+```{r}
+admin0 <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/UG admin boundaries/uga_admbnda_adm0_ubos_20200824.shp")
+st_crs(admin0)
+
+#admin_proj <- st_crs(admin)$proj4string
+admin0 <- admin0 %>% st_transform("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs +type=crs")
+
+
+admin_proj <- st_crs(admin0)$proj4string # save the projection
+
+# visualize Uganda boundary
+tm_shape(admin0)+
+  tm_polygons()
+
+#st_write(admin0, "admin0.shp")
+```
+
+## Road network data from OSM
+
+Only primary, secondary and tertiary roads were used while modeling travel time in AccessMod
+
+```{r}
+## using ?oe_get function in osmextract package
+road_osm = oe_get("uganda",
+             query = "SELECT * FROM 'lines' WHERE highway IS NOT NULL",
+             quiet=F, force_download=T)
+
+class(road_osm)
+View(road_osm)
+
+road_osm <- road_osm %>% dplyr::select(-c(4:8)) # remove unwanted colunms
+
+
+### some reclassification
+road_osm <- road_osm %>% mutate(class_n = highway)
+class(road_osm$class_n)
+road_osm$class_n <- as.factor(road_osm$class_n)
+road_osm$class_n[road_osm$class_n=="motorway_link"]<-"motorway"
+road_osm$class_n[road_osm$class_n=="primary_link"]<-"primary"
+road_osm$class_n[road_osm$class_n=="secondary_link"]<-"secondary"
+road_osm$class_n[road_osm$class_n=="trunk_link"]<-"trunk"
+road_osm$class_n[road_osm$class_n=="tertiary_link"]<-"tertiary"
+
+## remove some road classifications: irrelevant to the study area
+road_osm <- road_osm %>% filter(class_n != "bridleway")
+road_osm <- road_osm %>% filter(class_n != "construction")
+road_osm <- road_osm %>% filter(class_n != "passing_place")
+road_osm <- road_osm %>% filter(class_n != "proposed")
+road_osm <- road_osm %>% filter(class_n != "rest_area")
+road_osm <- road_osm %>% filter(class_n != "bridleway")
+road_osm <- road_osm %>% filter(class_n != "road")
+road_osm <- road_osm %>% filter(class_n != "services")
+road_osm <- road_osm %>% filter(class_n != "steps")
+road_osm <- road_osm %>% filter(class_n != "yes")
+
+#droplevels
+road_osm$class_n <-droplevels(road_osm$class_n)
+
+## add another column for labels
+road_osm <- road_osm %>% mutate(labels = class_n)
+
+road_osm$labels <- factor(road_osm$labels,
+        levels = c("motorway","trunk","primary","secondary",
+                   "tertiary","unclassified","residential",
+                   "footway","living_street","track","pedestrian",
+                   "service","path","cycleway"),
+        labels = c(1,2,3,4,5,6,7,8,9,10,11,12,13,14))
+
+#my road network
+roadnetwork <- road_osm %>% dplyr::select(c(1,6,7,5))
+
+## rename some columns
+roadnetwork <-   roadnetwork %>% 
+  rename(
+    label = class_n,
+    class = class_n2
+    )
+## coercise class to numeric
+roadnetwork$class <- as.integer(roadnetwork$class)
+
+## reproject roadnetwork data
+roadnetwork <- st_transform(roadnetwork, crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs"))
+
+### check road types
+### in the analysis i intend to use primary, secondary, and tertiary, roads only. These road classification are more accurate 
+
+table(roadnetwork$labels)
+
+## export this road network
+st_write(roadnetwork, "roadnetwork.shp")
+
+
+
+## map
+tm_shape(admin0) +
+  tm_polygons() +
+   tm_shape(roadnetwork) +
+  tm_lines ()
+
+View(roadnetwork)
+
+head(roadnetwork)
+```
+
+## Land cover data
+
+Raster at 100m resolution, 2019 Downloaded from Copernicus Global Land Service
+
+```{r}
+# load landcover data
+landcover <- rast("D:/PHP_spring_2024/SSCI 680/final project/datasets/landcover/PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif")
+class(landcover)
+
+res(landcover) # check resolution
+
+# clip raster land cover layer to Uganda admin boundary
+UGlandcover <- crop(landcover, extent(admin0))
+UGlandcover <- mask(UGlandcover, admin0)
+plot(UGlandcover)
+
+
+UGlandcover <- project(UGlandcover, "+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs", method="near") #re-projection
+
+plot(UGlandcover)
+
+
+### save raster land cover file at tif
+writeRaster(UGlandcover, filename = "UGlandcover.tif")
+
+
+## map landcover
+tm_shape(admin0) +
+  tm_polygons() +
+   tm_shape(UGlandcover) +
+  tm_raster ()
+
+```
+
+## Barriers to movement: rivers and lakes
+
+This data could be downloaded from OSM. However i used shape files already available from ICPAC Geoportal
+
+```{r}
+
+### river data from icpac geoportal
+rivers <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/rivers/3a37081d-1f4e-434e-b056-ca5e86ed7f62/uga_water_lines_dcw.shp")
+st_crs(rivers)$proj4string
+
+#View(rivers)
+
+### re-projection
+rivers_utm <- st_transform(rivers, crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs"))
+
+tm_shape(admin2) +
+  tm_polygons() +
+   tm_shape(rivers_utm) +
+  tm_lines ()
+
+##### save rivers as shape file
+st_write(rivers_utm, "rivers.shp")
+```
+
+## Lake data from ICPAC geoportal
+
+```{r}
+############################### lakes from ICPAC geoportal
+lakes <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/lakes/4b767c70-97e4-461d-a691-0e13fbf359bf/uga_water_areas_dcw.shp")
+
+st_crs(lakes)$proj4string
+#View(lakes)
+
+### re-projection
+lakes_utm <- st_transform(lakes, crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs"))
+
+tm_shape(admin2) +
+  tm_polygons() +
+   tm_shape(lakes_utm) +
+  tm_polygons ()
+
+##### save lakes as shape file
+st_write(lakes_utm, "lakes.shp")
+
+```
+
+## DEM
+
+obtained from the Africa geoportal. Prepared by The Shuttle Radar Topography Mission data at 30m resolution for Uganda. This raster layer was resampled to a 100m resolution. 100m is the resolution i used to model accessibility in AccessMod.
+
+```{r}
+srtm <- rast("D:/PHP_spring_2024/SSCI 680/final project/datasets/DEM/Uganda_SRTM30meters.tif")
+st_crs(srtm)$proj4string
+plot(srtm)
+
+##re-projection
+srtm_UTM <- srtm %>% terra::project("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs", method="near")
+plot(srtm_UTM)
+
+## change DEM resolution from 30 m to 100m
+# Resample the raster to match the resolution of the reference raster (landcover raster)
+srtm_UTM <- resample(srtm_UTM, UGlandcover, method = "bilinear")
+
+## save dem as USGSDEM file
+terra::writeRaster(srtm_UTM, filename = "UGDEM2.img", overwrite = TRUE)
+
+```
+
+## Population data
+
+The raster data was produced by WorldPop Research Group at the University of Southampton This data is at a 1km resolution. i resampled it to 100m resolution.
+
+```{r}
+pop_dat <- rast("D:/PHP_spring_2024/SSCI 680/final project/datasets/uga_pd_2020_1km.tif")
+plot(pop_dat)
+st_crs(admin)$proj4string
+
+## re-projection pop 
+pop_dat <- pop_dat %>% project("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs", method="near")  
+
+
+## save pop raster
+writeRaster(pop_dat, filename = "pop_rast_1km.tif")
+
+
+# Resample the raster to match the resolution of the reference raster (landcover raster)
+pop_dat_100m <- resample(pop_dat, UGlandcover, method = "bilinear")
+plot(pop_dat_100m)
+
+## save pop raster 100m
+writeRaster(pop_dat_100m, filename = "pop_rast_100m.tif")
+
+```
+
+## District admin shapefile
+
+this data contains district boundaries its relevant when conducting zonal analysis in AccessMod. zonal analysis is used i estimate the proportion of the population able to access a healthcare facility within a given travel time.
+
+```{r}
+ug_admin2 <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/UG admin boundaries/uga_admbnda_adm2_ubos_20200824.shp")
+
+## reproject admin2 data
+ug_admin2 <- st_transform(ug_admin2, crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs"))
+st_crs(ug_admin2)$proj4string
+
+tm_shape(admin2)+
+  tm_polygons()+
+  tm_shape(ug_admin2)+
+  tm_polygons()
+
+#save admin2 as shp
+st_write(ug_admin2, "UGadmin2.shp")
+```
+
+## Health facility data
+
+This data contains health facility data of different types. It was obtained from the ministry of health Uganda.
+
+```{r}
+facilities <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/healthhfacilities/healthcenters.shp")
+
+#View(facilities)
+
+####re-projection
+facilities_utm <- st_transform(facilities, crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs"))
+st_crs(facilities_utm)$proj4string
+
+# facilities per district
+tm_shape(admin2)+
+  tm_polygons()+
+  tm_shape(facilities_utm)+
+  tm_dots ()
+
+#save facilities as shp
+st_write(facilities_utm, "facilities.shp")
+```
+
+# ANALYSIS OF ACCESSIBILITY FOR SELECTED REGIONS
+
+Uganda has 4 major regions, but for my analysis, i focused on 2 regions (central and eastern). I subsetted the landcover, roadnetwork, facilities, and population datasets at a regional level. After data preparation, this was imported into AccessMod
+
+## UG regions
+
+```{r}
+admin1 <- st_read("D:/PHP_spring_2024/SSCI 680/final project/datasets/UG admin boundaries/uga_admbnda_adm1_ubos_20200824.shp")
+
+admin1 <- admin1 %>% st_transform("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs +type=crs")
+
+# visualize the regions
+tm_shape(admin1)+
+  tm_polygons()
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+## boundaries by regions, save them as shape files for used later
+system.time(for(i in 1:nrow(admin1)) {
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  a= st_as_sf(a)
+  st_write(a, paste0("Reg_", file_name[i], ".shp"), overwrite=T)
+}) 
+
+# visualize central region
+Reg_C <- st_read("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/Reg_Central.shp")
+
+tm_shape(Reg_C)+
+  tm_polygons()
+
+```
+
+## Creating land cover for each region and saving the raster layers
+
+```{r}
+#import UG landcover rater
+UGlandcover <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/UGlandcover.tif")
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+system.time(for(i in 1:nrow(admin1)) {
+  l = UGlandcover
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  a = vect(a)
+  r = terra::crop(l, a)
+  m = terra::mask(r, a)
+  st_write(m, paste0("Reglandcover_", file_name[i], ".tif"), overwrite=T)
+}) 
+
+
+# visualize landcover in Central region
+Reglandcover_central <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/Reglandcover_Central.tif")
+
+tm_shape(Reglandcover_central) +
+  tm_raster ()
+
+plot(Reglandcover_central)
+
+```
+
+## Creating DEM for each region and saving the raster layers
+
+```{r}
+## UGDEM layer
+UGDEM2 <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/UGDEM2.img")
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+system.time(for(i in 1:nrow(admin1)) {
+  l = UGDEM2
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  a = vect(a)
+  r = terra::crop(l, a)
+  m = terra::mask(r, a)
+  writeRaster(m, paste0("RegDEM_", file_name[i], ".tif"), overwrite=T)
+}) 
+
+
+# visualize DEM in Central region
+RegDEM_central <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/RegDEM_Central.tif")
+
+tm_shape(RegDEM_central) +
+  tm_raster ()
+
+
+```
+
+## Create population raster for each region
+
+```{r}
+## pop raster layer
+regpop100m <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/pop_rast_100m.tif")
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+system.time(for(i in 1:nrow(admin1)) {
+  l = regpop100m
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  a = vect(a)
+  r = terra::crop(l, a)
+  m = terra::mask(r, a)
+  writeRaster(m, paste0("RegPop_", file_name[i], ".tif"), overwrite=T)
+}) 
+
+
+# visualize population in Central region
+RegPop_central <- rast("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/RegPop_Central.tif")
+
+tm_shape(Reglandcover_central) +
+  tm_raster ()
+
+```
+
+## Create road network for each region
+
+```{r}
+# import road network
+roadnetwork <- st_read("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/roadnetwork.shp")
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+system.time(for(i in 1:nrow(admin1)) {
+  l = roadnetwork
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  #a = vect(a)
+  a= st_as_sf(a)
+  r = sf::st_intersection(l, a)
+  #m = terra::mask(r, a)
+  #p = terra::project(m, admin1$prj4, method = "near")
+  #values(p)[values(p) == 0] <- NA
+  st_write(r, paste0("Regroadnetwork_", file_name[i], ".shp"), overwrite=T)
+}) 
+
+# visualize roadnetwork in central region
+Regroadnetwork_C <- st_read("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/Regroadnetwork_Central.shp")
+
+tm_shape(Regroadnetwork_C)+
+  tm_lines()
+
+
+```
+
+## Create healthcare facilities for each region
+
+```{r}
+# import facilities
+UGfacilities <- st_read("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/facilities.shp")
+
+file_name <- admin1$ADM1_EN# to integrate country name in saving step later
+
+system.time(for(i in 1:nrow(admin1)) {
+  l = UGfacilities
+  a = admin1 %>% 
+    filter(ADM1_EN == file_name[i])
+  a= st_as_sf(a)
+  r = sf::st_intersection(l, a)
+  st_write(r, paste0("Regfacilities_", file_name[i], ".shp"), overwrite=T)
+}) 
+
+
+# visualize facilities in central region
+Regfacilities_C <- st_read("D:/PHP_spring_2024/SSCI 680/final project/SSCI680 final project data prep/Regfacilities_Central.shp")
+tm_shape(Reg_C)+
+  tm_polygons()+
+tm_shape(Regfacilities_C)+
+  tm_dots()
+```
